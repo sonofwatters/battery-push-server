@@ -2,12 +2,10 @@
   "name": "laptop-battery-server",
   "version": "1.0.0",
   "private": true,
-  "scripts": {
-    "start": "node server.cjs"
-  },
+  "scripts": { "start": "node server.cjs" },
   "engines": { "node": "20.x" },
   "dependencies": {
     "express": "^4.19.2",
-    "apn": "^3.0.0"
+    "apn": "2.2.0"
   }
 }
