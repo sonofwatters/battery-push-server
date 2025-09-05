@@ -1,153 +1,90 @@
-// server.js
-import express from 'express';
-import http2 from 'node:http2';
-import jwt from 'jsonwebtoken';
-import dotenv from 'dotenv';
-import fs from 'node:fs/promises';
+// server.js (Express + node-apn)
+const express = require('express');
+const bodyParser = require('body-parser');
+const apn = require('apn');
 
-dotenv.config();
+const SECRET    = process.env.SECRET || "change-me-to-a-long-random-string";
+const BUNDLE_ID = process.env.BUNDLE_ID;           // e.g. com.watterss.LaptopBattery
+const KEY       = process.env.APNS_KEY;            // raw .p8 contents
+const KEY_ID    = process.env.APNS_KEY_ID;         // e.g. 1A2B3C4D5E
+const TEAM_ID   = process.env.APPLE_TEAM_ID;       // e.g. 9ABCDE1234
 
-const {
-  TEAM_ID, KEY_ID, BUNDLE_ID, APNS_KEY_BASE64, APNS_ENV = 'sandbox', PORT
-} = process.env;
-
-// Fail early if a required env var is missing
-for (const [k, v] of Object.entries({ TEAM_ID, KEY_ID, BUNDLE_ID, APNS_KEY_BASE64 })) {
-  if (!v) {
-    console.error(`Missing env var: ${k}`);
-    process.exit(1);
-  }
-}
-
-const P8 = Buffer.from(APNS_KEY_BASE64, 'base64').toString('utf8');
-const APNS_ORIGIN = APNS_ENV === 'production'
-  ? 'https://api.push.apple.com'
-  : 'https://api.sandbox.push.apple.com';
+// APNs provider (token-based)
+const apnProvider = new apn.Provider({
+  token: { key: Buffer.from(KEY, 'utf8'), keyId: KEY_ID, teamId: TEAM_ID },
+  production: process.env.NODE_ENV === 'production'
+});
 
 const app = express();
-app.use(express.json());
+app.use(bodyParser.json());
 
-// simple persistence
-const DB_FILE = './db.json';
-let db = { devices: {}, states: {} };
-async function loadDb() { try { db = JSON.parse(await fs.readFile(DB_FILE, 'utf8')); } catch {} }
-async function saveDb() { await fs.writeFile(DB_FILE, JSON.stringify(db, null, 2)); }
-await loadDb();
+// In-memory stores
+const latest = new Map();          // deviceId -> { percent, charging, ts }
+const apnsToken = new Map();       // deviceId -> device token for app
+const liveToken = new Map();       // deviceId -> (optional) live activity push token
 
-// --- APNs helpers ---
-function makeAPNsJWT() {
-  return jwt.sign({ iss: TEAM_ID, iat: Math.floor(Date.now()/1000) }, P8, {
-    algorithm: 'ES256',
-    header: { alg: 'ES256', kid: KEY_ID }
-  });
+function auth(req) {
+  const s = req.headers['x-auth'] || req.body.secret;
+  return s && s === SECRET;
 }
 
-function sendLiveActivityPush(deviceToken, payload) {
-  const client = http2.connect(APNS_ORIGIN);
-  const jwtToken = makeAPNsJWT();
-
-  return new Promise((resolve, reject) => {
-    const req = client.request({
-      ':method': 'POST',
-      ':path': `/3/device/${deviceToken}`,
-      'authorization': `bearer ${jwtToken}`,
-      'apns-topic': `${BUNDLE_ID}.push-type.liveactivity`,
-      'apns-push-type': 'liveactivity',
-      'apns-priority': '10',
-      'content-type': 'application/json'
-    });
-    let resp = '';
-    req.setEncoding('utf8');
-    req.on('data', c => resp += c);
-    req.on('end', () => { client.close(); resolve(resp || 'ok'); });
-    req.on('error', e => { 
-        let errorReason = e;
-        try {
-            const parsedResp = JSON.parse(resp);
-            if (parsedResp && parsedResp.reason) { errorReason = parsedResp.reason; }
-        } catch {}
-        client.close(); 
-        reject(new Error(errorReason)); 
-    });
-    req.end(JSON.stringify(payload));
-  });
-}
-
-// --- routes ---
-app.get('/health', (req, res) => res.json({ ok: true, env: APNS_ENV }));
-
-app.post('/register-live-activity', async (req, res) => {
-  const { deviceId, token, secret } = req.body || {};
-  if (!deviceId || !token || !secret) return res.status(400).json({ error: 'missing deviceId/token/secret' });
-  
-  // Safely merge the new token with existing device data.
-  db.devices[deviceId] = { ...db.devices[deviceId], liveActivityToken: token, secret };
-  await saveDb();
-  console.log('🔗 registered live activity', deviceId, token.slice(0, 12) + '…');
-  res.json({ ok: true });
+// ---- Registration of APNs token (from AppDelegate on launch) ----
+app.post('/register', (req, res) => {
+  if (!auth(req)) return res.status(403).json({ error: 'unauthorized' });
+  const { deviceId, token } = req.body || {};
+  if (!deviceId || !token) return res.status(400).json({ error: 'missing deviceId or token' });
+  apnsToken.set(deviceId, token);
+  return res.json({ ok: true });
 });
 
-// REMOVED: The old, conflicting '/register' endpoint is gone.
+// ---- Optional: Live Activity token (we’re not using it directly in this flow) ----
+app.post('/register-live-activity', (req, res) => {
+  if (!auth(req)) return res.status(403).json({ error: 'unauthorized' });
+  const { deviceId, token } = req.body || {};
+  if (!deviceId || !token) return res.status(400).json({ error: 'missing deviceId or token' });
+  liveToken.set(deviceId, token);
+  return res.json({ ok: true });
+});
 
+// ---- Laptop posts latest reading ----
 app.post('/battery', async (req, res) => {
-  const { deviceId, secret, percent, charging } = req.body || {};
-  if (!deviceId || typeof secret !== 'string') return res.status(400).json({ error: 'missing deviceId/secret' });
-  const reg = db.devices[deviceId];
-  if (!reg || reg.secret !== secret) return res.status(403).json({ error: 'unauthorized' });
-  
-  // Update state regardless of push status
-  const p = Number(percent), c = !!charging;
-  db.states[deviceId] = { percent: p, charging: c, updatedAt: Date.now() };
-  await saveDb();
-
-  if (!reg.liveActivityToken) {
-    console.log('ℹ️ No Live Activity token for', deviceId, '; skipping push.');
-    return res.status(200).json({ ok: true, message: 'no live activity registered' });
+  if (!auth(req)) return res.status(403).json({ error: 'unauthorized' });
+  const { deviceId, percent, charging } = req.body || {};
+  if (!deviceId || typeof percent !== 'number' || typeof charging !== 'boolean') {
+    return res.status(400).json({ error: 'bad payload' });
   }
+  latest.set(deviceId, { percent, charging, ts: Date.now() });
 
-  try {
-    const payload = {
-      aps: {
-        timestamp: Math.floor(Date.now() / 1000),
-        event: 'update',
-        'content-state': { percent: (p|0), charging: c }
-      }
-    };
-    const resp = await sendLiveActivityPush(reg.liveActivityToken, payload);
-    console.log('🚀 Pushed Live Activity ->', deviceId, p, c, '| APNs:', resp || 'ok');
-  } catch (e) {
-    const errorMessage = e?.message || e.toString();
-    if (errorMessage.includes('BadDeviceToken') || errorMessage.includes('Unregistered')) {
-        console.log('🗑️ Stale Live Activity token for', deviceId, '; removing.');
-        delete reg.liveActivityToken;
-        await saveDb();
+  // Send a SILENT push to the app (so it saves & refreshes widget + live activity)
+  const token = apnsToken.get(deviceId);
+  if (token && BUNDLE_ID) {
+    const note = new apn.Notification();
+    note.topic = BUNDLE_ID;             // your app bundle id
+    note.pushType = 'background';       // silent
+    note.contentAvailable = 1;
+    note.payload = { battery: { percent, charging } };
+
+    try {
+      const result = await apnProvider.send(note, token);
+      // Optional logging
+      console.log('APNs push sent:', JSON.stringify(result.sent));
+      if (result.failed?.length) console.warn('APNs push failed:', result.failed);
+    } catch (e) {
+      console.error('APNs error', e);
     }
-    console.error('❌ Live Activity push failed:', errorMessage);
   }
-  
-  res.json({ ok: true });
+
+  return res.json({ ok: true });
 });
 
-// ADDED BACK: This endpoint is for the "Refresh Manually" button in the app.
+// ---- iOS/widget fetch endpoint ----
 app.get('/battery/:deviceId', (req, res) => {
-  const { deviceId } = req.params;
-  const secret = req.headers['x-auth'];
-  const reg = db.devices[deviceId];
-  const state = db.states[deviceId];
-
-  if (!reg || reg.secret !== secret) {
-    return res.status(403).json({ error: 'unauthorized' });
-  }
-
-  if (state) {
-    res.json(state);
-  } else {
-    res.status(404).json({ error: 'no state found for device' });
-  }
+  if (!auth(req)) return res.status(403).json({ error: 'unauthorized' });
+  const item = latest.get(req.params.deviceId);
+  if (!item) return res.status(404).json({ error: 'no data' });
+  res.json({ percent: item.percent, charging: item.charging, ts: item.ts });
 });
 
-// --- start server ---
-const port = Number(PORT || 8787);
-app.listen(port, () => {
-  console.log(`Server listening on :${port} (APNs: ${APNS_ENV})`);
-});
+app.get('/', (_, res) => res.send('OK'));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('Server listening on', PORT));
