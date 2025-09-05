@@ -107,6 +107,25 @@ app.post('/battery', async (req, res) => {
   res.json({ ok: true });
 });
 
+// NEW: Add a route for the iOS app to pull the latest state
+app.get('/battery/:deviceId', (req, res) => {
+  const { deviceId } = req.params;
+  const secret = req.headers['x-auth'];
+  const reg = db.devices[deviceId];
+  const state = db.states[deviceId];
+
+  if (!reg || reg.secret !== secret) {
+    return res.status(403).json({ error: 'unauthorized' });
+  }
+
+  if (state) {
+    res.json(state);
+  } else {
+    res.status(404).json({ error: 'no state found for device' });
+  }
+});
+
+
 // --- start server ---
 const port = Number(PORT || 8787);
 app.listen(port, () => {
