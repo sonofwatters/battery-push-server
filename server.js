@@ -37,12 +37,11 @@ await loadDb();
 // --- APNs helpers ---
 function makeAPNsJWT() {
   return jwt.sign({ iss: TEAM_ID, iat: Math.floor(Date.now()/1000) }, P8, {
-    algorithm: 'ES256', // CORRECTED: Was 'ES265'
+    algorithm: 'ES256',
     header: { alg: 'ES256', kid: KEY_ID }
   });
 }
 
-// MODIFIED: This function is now for sending high-priority Live Activity updates.
 function sendLiveActivityPush(deviceToken, payload) {
   const client = http2.connect(APNS_ORIGIN);
   const jwtToken = makeAPNsJWT();
@@ -52,9 +51,9 @@ function sendLiveActivityPush(deviceToken, payload) {
       ':method': 'POST',
       ':path': `/3/device/${deviceToken}`,
       'authorization': `bearer ${jwtToken}`,
-      'apns-topic': `${BUNDLE_ID}.push-type.liveactivity`, // NOTE: Special topic for Live Activities
-      'apns-push-type': 'liveactivity',   // CHANGED
-      'apns-priority': '10',              // CHANGED to high priority
+      'apns-topic': `${BUNDLE_ID}.push-type.liveactivity`,
+      'apns-push-type': 'liveactivity',
+      'apns-priority': '10',
       'content-type': 'application/json'
     });
     let resp = '';
@@ -62,13 +61,10 @@ function sendLiveActivityPush(deviceToken, payload) {
     req.on('data', c => resp += c);
     req.on('end', () => { client.close(); resolve(resp || 'ok'); });
     req.on('error', e => { 
-        // Capture the full error response for better debugging
         let errorReason = e;
         try {
             const parsedResp = JSON.parse(resp);
-            if (parsedResp && parsedResp.reason) {
-                errorReason = parsedResp.reason;
-            }
+            if (parsedResp && parsedResp.reason) { errorReason = parsedResp.reason; }
         } catch {}
         client.close(); 
         reject(new Error(errorReason)); 
@@ -80,11 +76,22 @@ function sendLiveActivityPush(deviceToken, payload) {
 // --- routes ---
 app.get('/health', (req, res) => res.json({ ok: true, env: APNS_ENV }));
 
-// MODIFIED: This endpoint now stores a Live Activity push token, not a device token.
+// RE-ADDED: The original endpoint for the C# client to register its deviceId and secret.
+app.post('/register', async (req, res) => {
+  const { deviceId, secret } = req.body || {};
+  if (!deviceId || !secret) return res.status(400).json({ error: 'missing deviceId/secret' });
+  // This creates the initial record for the device.
+  db.devices[deviceId] = { secret };
+  await saveDb();
+  console.log('🔗 registered device shell', deviceId);
+  res.json({ ok: true });
+});
+
+// The endpoint for the iOS app to add its Live Activity token.
 app.post('/register-live-activity', async (req, res) => {
   const { deviceId, token, secret } = req.body || {};
   if (!deviceId || !token || !secret) return res.status(400).json({ error: 'missing deviceId/token/secret' });
-  // Store the live activity token against the deviceId
+  // This adds the live activity token to the existing device record.
   db.devices[deviceId] = { ...db.devices[deviceId], liveActivityToken: token, secret };
   await saveDb();
   console.log('🔗 registered live activity', deviceId, token.slice(0, 12) + '…');
@@ -97,7 +104,6 @@ app.post('/battery', async (req, res) => {
   const reg = db.devices[deviceId];
   if (!reg || reg.secret !== secret) return res.status(403).json({ error: 'unauthorized' });
   
-  // A Live Activity must be active to receive a push.
   if (!reg.liveActivityToken) {
     console.log('ℹ️ No Live Activity token for', deviceId, '; skipping push.');
     return res.status(200).json({ ok: true, message: 'no live activity registered' });
@@ -108,7 +114,6 @@ app.post('/battery', async (req, res) => {
   await saveDb();
   
   try {
-    // MODIFIED: The payload structure for Live Activities is very specific.
     const payload = {
       aps: {
         timestamp: Math.floor(Date.now() / 1000),
@@ -123,7 +128,6 @@ app.post('/battery', async (req, res) => {
     console.log('🚀 Pushed Live Activity ->', deviceId, p, c, '| APNs:', resp || 'ok');
   } catch (e) {
     const errorMessage = e?.message || e.toString();
-    // If the token is invalid/expired (e.g., activity ended), remove it.
     if (errorMessage.includes('BadDeviceToken') || errorMessage.includes('Unregistered')) {
         console.log('🗑️ Stale Live Activity token for', deviceId, '; removing.');
         delete reg.liveActivityToken;
