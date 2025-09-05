@@ -37,12 +37,13 @@ await loadDb();
 // --- APNs helpers ---
 function makeAPNsJWT() {
   return jwt.sign({ iss: TEAM_ID, iat: Math.floor(Date.now()/1000) }, P8, {
-    algorithm: 'ES256',
+    algorithm: 'ES265',
     header: { alg: 'ES256', kid: KEY_ID }
   });
 }
 
-function sendBackgroundPush(deviceToken, payload) {
+// MODIFIED: This function is now for sending high-priority Live Activity updates.
+function sendLiveActivityPush(deviceToken, payload) {
   const client = http2.connect(APNS_ORIGIN);
   const jwtToken = makeAPNsJWT();
 
@@ -51,10 +52,9 @@ function sendBackgroundPush(deviceToken, payload) {
       ':method': 'POST',
       ':path': `/3/device/${deviceToken}`,
       'authorization': `bearer ${jwtToken}`,
-      'apns-topic': BUNDLE_ID,
-      'apns-push-type': 'background',
-      'apns-priority': '5',
-      'apns-collapse-id': 'battery',
+      'apns-topic': `${BUNDLE_ID}.push-type.liveactivity`, // NOTE: Special topic for Live Activities
+      'apns-push-type': 'liveactivity',   // CHANGED
+      'apns-priority': '10',              // CHANGED to high priority
       'content-type': 'application/json'
     });
     let resp = '';
@@ -69,12 +69,14 @@ function sendBackgroundPush(deviceToken, payload) {
 // --- routes ---
 app.get('/health', (req, res) => res.json({ ok: true, env: APNS_ENV }));
 
-app.post('/register', async (req, res) => {
+// MODIFIED: This endpoint now stores a Live Activity push token, not a device token.
+app.post('/register-live-activity', async (req, res) => {
   const { deviceId, token, secret } = req.body || {};
   if (!deviceId || !token || !secret) return res.status(400).json({ error: 'missing deviceId/token/secret' });
-  db.devices[deviceId] = { token, secret };
+  // Store the live activity token against the deviceId
+  db.devices[deviceId] = { ...db.devices[deviceId], liveActivityToken: token, secret };
   await saveDb();
-  console.log('🔗 registered', deviceId, token.slice(0, 12) + '…');
+  console.log('🔗 registered live activity', deviceId, token.slice(0, 12) + '…');
   res.json({ ok: true });
 });
 
@@ -83,48 +85,46 @@ app.post('/battery', async (req, res) => {
   if (!deviceId || typeof secret !== 'string') return res.status(400).json({ error: 'missing deviceId/secret' });
   const reg = db.devices[deviceId];
   if (!reg || reg.secret !== secret) return res.status(403).json({ error: 'unauthorized' });
+  
+  // A Live Activity must be active to receive a push.
+  if (!reg.liveActivityToken) {
+    console.log('ℹ️ No Live Activity token for', deviceId, '; skipping push.');
+    return res.status(200).json({ ok: true, message: 'no live activity registered' });
+  }
 
   const p = Number(percent), c = !!charging;
-  const prev = db.states[deviceId];
-  const now = Date.now();
-  db.states[deviceId] = { percent: p, charging: c, updatedAt: now, lastPushAt: prev?.lastPushAt || 0 };
+  db.states[deviceId] = { percent: p, charging: c, updatedAt: Date.now() };
   await saveDb();
-
-  const changed = !prev || Math.abs((p|0) - (prev.percent|0)) >= 1;
-  const timeOk  = !prev || (now - (prev.lastPushAt || 0) > 5*60*1000);
-
-  if (changed || timeOk) {
-    try {
-      const payload = { aps: { 'content-available': 1 }, deviceId, battery: { percent: (p|0), charging: c } };
-      const resp = await sendBackgroundPush(reg.token, payload);
-      db.states[deviceId].lastPushAt = now;
-      await saveDb();
-      console.log('📣 pushed ->', deviceId, p, c, '| APNs:', resp || 'ok');
-    } catch (e) {
-      console.error('❌ push failed:', e?.message || e);
+  
+  try {
+    // MODIFIED: The payload structure for Live Activities is very specific.
+    const payload = {
+      aps: {
+        timestamp: Math.floor(Date.now() / 1000),
+        event: 'update',
+        'content-state': {
+          percent: (p|0),
+          charging: c
+        }
+      }
+    };
+    const resp = await sendLiveActivityPush(reg.liveActivityToken, payload);
+    console.log('🚀 Pushed Live Activity ->', deviceId, p, c, '| APNs:', resp || 'ok');
+  } catch (e) {
+    // If the token is invalid/expired (e.g., activity ended), remove it.
+    if (e?.message?.includes('BadDeviceToken') || e?.message?.includes('Unregistered')) {
+        console.log('🗑️ Stale Live Activity token for', deviceId, '; removing.');
+        delete reg.liveActivityToken;
+        await saveDb();
     }
+    console.error('❌ Live Activity push failed:', e?.message || e);
   }
+  
   res.json({ ok: true });
 });
 
-// NEW: Add a route for the iOS app to pull the latest state
-app.get('/battery/:deviceId', (req, res) => {
-  const { deviceId } = req.params;
-  const secret = req.headers['x-auth'];
-  const reg = db.devices[deviceId];
-  const state = db.states[deviceId];
 
-  if (!reg || reg.secret !== secret) {
-    return res.status(403).json({ error: 'unauthorized' });
-  }
-
-  if (state) {
-    res.json(state);
-  } else {
-    res.status(404).json({ error: 'no state found for device' });
-  }
-});
-
+// NOTE: The GET /battery and POST /register endpoints can be removed if you no longer need them.
 
 // --- start server ---
 const port = Number(PORT || 8787);
