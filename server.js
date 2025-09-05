@@ -76,27 +76,18 @@ function sendLiveActivityPush(deviceToken, payload) {
 // --- routes ---
 app.get('/health', (req, res) => res.json({ ok: true, env: APNS_ENV }));
 
-// RE-ADDED: The original endpoint for the C# client to register its deviceId and secret.
-app.post('/register', async (req, res) => {
-  const { deviceId, secret } = req.body || {};
-  if (!deviceId || !secret) return res.status(400).json({ error: 'missing deviceId/secret' });
-  // This creates the initial record for the device.
-  db.devices[deviceId] = { secret };
-  await saveDb();
-  console.log('🔗 registered device shell', deviceId);
-  res.json({ ok: true });
-});
-
-// The endpoint for the iOS app to add its Live Activity token.
 app.post('/register-live-activity', async (req, res) => {
   const { deviceId, token, secret } = req.body || {};
   if (!deviceId || !token || !secret) return res.status(400).json({ error: 'missing deviceId/token/secret' });
-  // This adds the live activity token to the existing device record.
+  
+  // Safely merge the new token with existing device data.
   db.devices[deviceId] = { ...db.devices[deviceId], liveActivityToken: token, secret };
   await saveDb();
   console.log('🔗 registered live activity', deviceId, token.slice(0, 12) + '…');
   res.json({ ok: true });
 });
+
+// REMOVED: The old, conflicting '/register' endpoint is gone.
 
 app.post('/battery', async (req, res) => {
   const { deviceId, secret, percent, charging } = req.body || {};
@@ -104,24 +95,22 @@ app.post('/battery', async (req, res) => {
   const reg = db.devices[deviceId];
   if (!reg || reg.secret !== secret) return res.status(403).json({ error: 'unauthorized' });
   
+  // Update state regardless of push status
+  const p = Number(percent), c = !!charging;
+  db.states[deviceId] = { percent: p, charging: c, updatedAt: Date.now() };
+  await saveDb();
+
   if (!reg.liveActivityToken) {
     console.log('ℹ️ No Live Activity token for', deviceId, '; skipping push.');
     return res.status(200).json({ ok: true, message: 'no live activity registered' });
   }
 
-  const p = Number(percent), c = !!charging;
-  db.states[deviceId] = { percent: p, charging: c, updatedAt: Date.now() };
-  await saveDb();
-  
   try {
     const payload = {
       aps: {
         timestamp: Math.floor(Date.now() / 1000),
         event: 'update',
-        'content-state': {
-          percent: (p|0),
-          charging: c
-        }
+        'content-state': { percent: (p|0), charging: c }
       }
     };
     const resp = await sendLiveActivityPush(reg.liveActivityToken, payload);
@@ -137,6 +126,24 @@ app.post('/battery', async (req, res) => {
   }
   
   res.json({ ok: true });
+});
+
+// ADDED BACK: This endpoint is for the "Refresh Manually" button in the app.
+app.get('/battery/:deviceId', (req, res) => {
+  const { deviceId } = req.params;
+  const secret = req.headers['x-auth'];
+  const reg = db.devices[deviceId];
+  const state = db.states[deviceId];
+
+  if (!reg || reg.secret !== secret) {
+    return res.status(403).json({ error: 'unauthorized' });
+  }
+
+  if (state) {
+    res.json(state);
+  } else {
+    res.status(404).json({ error: 'no state found for device' });
+  }
 });
 
 // --- start server ---
