@@ -37,7 +37,7 @@ await loadDb();
 // --- APNs helpers ---
 function makeAPNsJWT() {
   return jwt.sign({ iss: TEAM_ID, iat: Math.floor(Date.now()/1000) }, P8, {
-    algorithm: 'ES265',
+    algorithm: 'ES256', // CORRECTED: Was 'ES265'
     header: { alg: 'ES256', kid: KEY_ID }
   });
 }
@@ -61,7 +61,18 @@ function sendLiveActivityPush(deviceToken, payload) {
     req.setEncoding('utf8');
     req.on('data', c => resp += c);
     req.on('end', () => { client.close(); resolve(resp || 'ok'); });
-    req.on('error', e => { client.close(); reject(e); });
+    req.on('error', e => { 
+        // Capture the full error response for better debugging
+        let errorReason = e;
+        try {
+            const parsedResp = JSON.parse(resp);
+            if (parsedResp && parsedResp.reason) {
+                errorReason = parsedResp.reason;
+            }
+        } catch {}
+        client.close(); 
+        reject(new Error(errorReason)); 
+    });
     req.end(JSON.stringify(payload));
   });
 }
@@ -111,20 +122,18 @@ app.post('/battery', async (req, res) => {
     const resp = await sendLiveActivityPush(reg.liveActivityToken, payload);
     console.log('🚀 Pushed Live Activity ->', deviceId, p, c, '| APNs:', resp || 'ok');
   } catch (e) {
+    const errorMessage = e?.message || e.toString();
     // If the token is invalid/expired (e.g., activity ended), remove it.
-    if (e?.message?.includes('BadDeviceToken') || e?.message?.includes('Unregistered')) {
+    if (errorMessage.includes('BadDeviceToken') || errorMessage.includes('Unregistered')) {
         console.log('🗑️ Stale Live Activity token for', deviceId, '; removing.');
         delete reg.liveActivityToken;
         await saveDb();
     }
-    console.error('❌ Live Activity push failed:', e?.message || e);
+    console.error('❌ Live Activity push failed:', errorMessage);
   }
   
   res.json({ ok: true });
 });
-
-
-// NOTE: The GET /battery and POST /register endpoints can be removed if you no longer need them.
 
 // --- start server ---
 const port = Number(PORT || 8787);
